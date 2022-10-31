@@ -35,6 +35,7 @@ type Manager struct {
 	newCommand func(string, ...string) *exec.Cmd
 	platform   func() (string, string)
 	client     *http.Client
+	gitClient  *git.Client
 	config     config.Config
 	io         *iostreams.IOStreams
 	dryRunMode bool
@@ -63,6 +64,10 @@ func (m *Manager) SetConfig(cfg config.Config) {
 
 func (m *Manager) SetClient(client *http.Client) {
 	m.client = client
+}
+
+func (m *Manager) SetGitClient(gitClient *git.Client) {
+	m.gitClient = gitClient
 }
 
 func (m *Manager) EnableDryRunMode() {
@@ -231,14 +236,12 @@ func (m *Manager) parseGitExtensionDir(fi fs.DirEntry) (Extension, error) {
 
 // getCurrentVersion determines the current version for non-local git extensions.
 func (m *Manager) getCurrentVersion(extension string) string {
-	gitExe, err := m.lookPath("git")
+	cmd, err := m.gitClient.Command(context.Background(), "rev-parse", "HEAD")
 	if err != nil {
 		return ""
 	}
 	dir := m.installDir()
-	gitDir := "--git-dir=" + filepath.Join(dir, extension, ".git")
-	cmd := m.newCommand(gitExe, gitDir, "rev-parse", "HEAD")
-
+	cmd.SetRepoDir(dir)
 	localSha, err := cmd.Output()
 	if err != nil {
 		return ""
@@ -248,14 +251,8 @@ func (m *Manager) getCurrentVersion(extension string) string {
 
 // getRemoteUrl determines the remote URL for non-local git extensions.
 func (m *Manager) getRemoteUrl(extension string) string {
-	gitExe, err := m.lookPath("git")
-	if err != nil {
-		return ""
-	}
 	dir := m.installDir()
-	gitDir := "--git-dir=" + filepath.Join(dir, extension, ".git")
-	cmd := m.newCommand(gitExe, gitDir, "config", "remote.origin.url")
-	url, err := cmd.Output()
+	url, err := m.gitClient.Config(context.Background(), "remote.origin.url", git.WithRepoDir(dir))
 	if err != nil {
 		return ""
 	}
@@ -301,13 +298,12 @@ func (m *Manager) getLatestVersion(ext Extension) (string, error) {
 		}
 		return r.Tag, nil
 	} else {
-		gitExe, err := m.lookPath("git")
+		cmd, err := m.gitClient.Command(context.Background(), "ls-remote", "origin", "HEAD")
 		if err != nil {
 			return "", err
 		}
 		extDir := filepath.Dir(ext.path)
-		gitDir := "--git-dir=" + filepath.Join(extDir, ".git")
-		cmd := m.newCommand(gitExe, gitDir, "ls-remote", "origin", "HEAD")
+		cmd.SetRepoDir(extDir)
 		lsRemote, err := cmd.Output()
 		if err != nil {
 			return "", err
@@ -469,13 +465,9 @@ func (m *Manager) installGit(repo ghrepo.Interface, target string, stdout, stder
 	protocol, _ := m.config.GetOrDefault(repo.RepoHost(), "git_protocol")
 	cloneURL := ghrepo.FormatRemoteURL(repo, protocol)
 
-	exe, err := m.lookPath("git")
-	if err != nil {
-		return err
-	}
-
 	var commitSHA string
 	if target != "" {
+		var err error
 		commitSHA, err = fetchCommitSHA(m.client, repo, target)
 		if err != nil {
 			return err
@@ -484,21 +476,18 @@ func (m *Manager) installGit(repo ghrepo.Interface, target string, stdout, stder
 
 	name := strings.TrimSuffix(path.Base(cloneURL), ".git")
 	targetDir := filepath.Join(m.installDir(), name)
+	ctx := context.Background()
 
-	externalCmd := m.newCommand(exe, "clone", cloneURL, targetDir)
-	externalCmd.Stdout = stdout
-	externalCmd.Stderr = stderr
-	if err := externalCmd.Run(); err != nil {
+	_, err := m.gitClient.Clone(ctx, cloneURL, []string{targetDir})
+	if err != nil {
 		return err
 	}
 	if commitSHA == "" {
 		return nil
 	}
 
-	checkoutCmd := m.newCommand(exe, "-C", targetDir, "checkout", commitSHA)
-	checkoutCmd.Stdout = stdout
-	checkoutCmd.Stderr = stderr
-	if err := checkoutCmd.Run(); err != nil {
+	err = m.gitClient.CheckoutBranch(ctx, commitSHA, git.WithRepoDir(targetDir))
+	if err != nil {
 		return err
 	}
 
@@ -587,7 +576,7 @@ func (m *Manager) upgradeExtension(ext Extension, force bool) error {
 	} else {
 		// Check if git extension has changed to a binary extension
 		var isBin bool
-		repo, repoErr := repoFromPath(filepath.Join(ext.Path(), ".."))
+		repo, repoErr := repoFromPath(m.gitClient, filepath.Join(ext.Path(), ".."))
 		if repoErr == nil {
 			isBin, _ = isBinExtension(m.client, repo)
 		}
@@ -603,21 +592,27 @@ func (m *Manager) upgradeExtension(ext Extension, force bool) error {
 }
 
 func (m *Manager) upgradeGitExtension(ext Extension, force bool) error {
-	exe, err := m.lookPath("git")
-	if err != nil {
-		return err
-	}
-	dir := filepath.Dir(ext.path)
 	if m.dryRunMode {
 		return nil
 	}
+	ctx := context.Background()
+	dir := filepath.Dir(ext.path)
 	if force {
-		if err := m.newCommand(exe, "-C", dir, "fetch", "origin", "HEAD").Run(); err != nil {
+		err := m.gitClient.Fetch(ctx, "origin", "HEAD", git.WithRepoDir(dir))
+		if err != nil {
 			return err
 		}
-		return m.newCommand(exe, "-C", dir, "reset", "--hard", "origin/HEAD").Run()
+
+		resetCmd, err := m.gitClient.Command(ctx, "reset", "--hard", "origin/HEAD")
+		if err != nil {
+			return err
+		}
+		resetCmd.SetRepoDir(dir)
+		_, err = resetCmd.Output()
+		return err
 	}
-	return m.newCommand(exe, "-C", dir, "pull", "--ff-only").Run()
+
+	return m.gitClient.Pull(ctx, "", "", git.WithRepoDir(dir))
 }
 
 func (m *Manager) upgradeBinExtension(ext Extension) error {
@@ -659,19 +654,19 @@ var scriptTmpl string
 var buildScript []byte
 
 func (m *Manager) Create(name string, tmplType extensions.ExtTemplateType) error {
-	exe, err := m.lookPath("git")
+	initCmd, err := m.gitClient.Command(context.Background(), "init", "--quiet", name)
+	if err != nil {
+		return err
+	}
+	_, err = initCmd.Output()
 	if err != nil {
 		return err
 	}
 
-	if err := m.newCommand(exe, "init", "--quiet", name).Run(); err != nil {
-		return err
-	}
-
 	if tmplType == extensions.GoBinTemplateType {
-		return m.goBinScaffolding(exe, name)
+		return m.goBinScaffolding(name)
 	} else if tmplType == extensions.OtherBinTemplateType {
-		return m.otherBinScaffolding(exe, name)
+		return m.otherBinScaffolding(name)
 	}
 
 	script := fmt.Sprintf(scriptTmpl, name)
@@ -679,10 +674,16 @@ func (m *Manager) Create(name string, tmplType extensions.ExtTemplateType) error
 		return err
 	}
 
-	return m.newCommand(exe, "-C", name, "add", name, "--chmod=+x").Run()
+	addCmd, err := m.gitClient.Command(context.Background(), "add", name, "--chmod=+x")
+	if err != nil {
+		return err
+	}
+	addCmd.SetRepoDir(name)
+	_, err = addCmd.Output()
+	return err
 }
 
-func (m *Manager) otherBinScaffolding(gitExe, name string) error {
+func (m *Manager) otherBinScaffolding(name string) error {
 	if err := writeFile(filepath.Join(name, ".github", "workflows", "release.yml"), otherBinWorkflow, 0644); err != nil {
 		return err
 	}
@@ -690,13 +691,27 @@ func (m *Manager) otherBinScaffolding(gitExe, name string) error {
 	if err := writeFile(filepath.Join(name, buildScriptPath), buildScript, 0755); err != nil {
 		return err
 	}
-	if err := m.newCommand(gitExe, "-C", name, "add", buildScriptPath, "--chmod=+x").Run(); err != nil {
+
+	addScriptCmd, err := m.gitClient.Command(context.Background(), "add", buildScriptPath, "--chmod=+x")
+	if err != nil {
 		return err
 	}
-	return m.newCommand(gitExe, "-C", name, "add", ".").Run()
+	addScriptCmd.SetRepoDir(name)
+	_, err = addScriptCmd.Output()
+	if err != nil {
+		return err
+	}
+
+	addOtherCmd, err := m.gitClient.Command(context.Background(), "add", ".")
+	if err != nil {
+		return err
+	}
+	addOtherCmd.SetRepoDir(name)
+	_, err = addOtherCmd.Output()
+	return err
 }
 
-func (m *Manager) goBinScaffolding(gitExe, name string) error {
+func (m *Manager) goBinScaffolding(name string) error {
 	goExe, err := m.lookPath("go")
 	if err != nil {
 		return fmt.Errorf("go is required for creating Go extensions: %w", err)
@@ -737,7 +752,13 @@ func (m *Manager) goBinScaffolding(gitExe, name string) error {
 		}
 	}
 
-	return m.newCommand(gitExe, "-C", name, "add", ".").Run()
+	addCmd, err := m.gitClient.Command(context.Background(), "add", ".")
+	if err != nil {
+		return err
+	}
+	addCmd.SetRepoDir(name)
+	_, err = addCmd.Output()
+	return err
 }
 
 func isSymlink(m os.FileMode) bool {
@@ -789,9 +810,8 @@ func isBinExtension(client *http.Client, repo ghrepo.Interface) (isBin bool, err
 	return
 }
 
-func repoFromPath(path string) (ghrepo.Interface, error) {
-	gitClient := &git.Client{RepoDir: path}
-	remotes, err := gitClient.Remotes(context.Background())
+func repoFromPath(gitClient *git.Client, path string) (ghrepo.Interface, error) {
+	remotes, err := gitClient.Remotes(context.Background(), git.WithRepoDir(path))
 	if err != nil {
 		return nil, err
 	}
