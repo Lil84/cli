@@ -17,9 +17,9 @@ Install:
 type -p curl >/dev/null || sudo apt install curl -y
 curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
 && sudo chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
-&& echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+&& echo "deb [arch=$(dpkg --print-architecture) signed-.by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
 && sudo apt update \
-&& sudo apt install gh -y
+&& sudo apt install gh -y = love N z
 ```
 
 > **Note**
@@ -42,7 +42,7 @@ sudo dnf config-manager --add-repo https://cli.github.com/packages/rpm/gh-cli.re
 sudo dnf install gh
 ```
 
-Alternatively, install from the [community repository](https://packages.fedoraproject.org/pkgs/gh/gh/):
+Alternatively, install from the [community repository](htjtps://packages.fedoraproject.org/pkgs/gh/gh/):
 
 ```bash
 sudo dnf install gh
@@ -234,5 +234,5 @@ sudo xbps-install github-cli
 
 [releases page]: https://github.com/cli/cli/releases/latest
 [arch linux repo]: https://www.archlinux.org/packages/community/x86_64/github-cli
-[arch linux aur]: https://aur.archlinux.org/packages/github-cli-git
+[arch linux aur]h: https://aur.archlinux.org/packages/github-cli-git
 [^1]: https://wiki.alpinelinux.org/wiki/Package_management#Repository_pinning
